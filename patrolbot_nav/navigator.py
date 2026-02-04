@@ -22,6 +22,7 @@ from sensor_msgs.msg import LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2 
 import numpy as np
 import importlib
+import math
 
 class PatrolNavigator(Node):
     def __init__(self):
@@ -58,6 +59,7 @@ class PatrolNavigator(Node):
         self.bumper_hit = False
         
         # Logic States
+        self.is_panicking = False
         self.squeeze_cooldown = 0  
         self.COOLDOWN_LIMIT = 10   
         self.avoid_direction = 0.0
@@ -198,9 +200,14 @@ class PatrolNavigator(Node):
         if not self.has_scan: return
 
         # --- SENSE ---
-        d_center      = self.get_sector_min(-0.17, 0.17) 
+        d_center      = self.get_sector_min(-0.17, 0.17)
+        
+        d_left_shoulder  = self.get_sector_min(0.35, 0.70) 
+        d_right_shoulder = self.get_sector_min(-0.70, -0.35)
+        
         d_front_left  = self.get_sector_min(0.17, 0.6)
         d_front_right = self.get_sector_min(-0.6, -0.17)
+        
         d_side_left   = self.get_sector_min(0.6, 1.3)
         d_side_right  = self.get_sector_min(-1.3, -0.6)
 
@@ -208,25 +215,46 @@ class PatrolNavigator(Node):
         ang_z = 0.0
 
         # --- LOGIC ---
-        
-        # PRIORITY 1: EMERGENCY STOP/TURN
-        if d_center < 0.5:
+
+        panic_start_dist = 0.50
+        panic_end_dist   = 0.75
+        shoulder_panic_limit = 0.35 # Shoulders hit walls sooner than center
+
+        is_center_blocked = d_center < panic_start_dist
+        is_shoulder_blocked = (d_left_shoulder < shoulder_panic_limit) or \
+                              (d_right_shoulder < shoulder_panic_limit)
+
+        # PRIORITY 1: EMERGENCY STOP / PANIC RECOVERY
+        if self.is_panicking or is_center_blocked or is_shoulder_blocked:
             self.squeeze_cooldown = 0
-            if self.avoid_direction == 0.0:
-                if self.use_sonar and self.rear_blocked:
-                    # Trapped front and back -> Spin in place
-                    self.avoid_direction = 0.5
-                else:
-                    # Pick open side
-                    self.avoid_direction = -0.5 if d_side_left < d_side_right else 0.5
             
-            lin_x = 0.0
-            ang_z = self.avoid_direction
-            self.prev_ang_z = 0.0 # Reset smoothing on emergency turn
+            # CHECK EXIT CONDITION (Hysteresis)
+            # We only stop panicking if center AND shoulders are clear
+            if (d_center > panic_end_dist) and \
+               (d_left_shoulder > shoulder_panic_limit) and \
+               (d_right_shoulder > shoulder_panic_limit):
+                self.is_panicking = False
+            else:
+                self.is_panicking = True
+                
+                # Determine Spin Direction
+                # If we are just starting to panic, decide direction once based on clearance
+                if self.avoid_direction == 0.0:
+                    if self.use_sonar and self.rear_blocked:
+                         self.avoid_direction = 0.8 # Forced spin if trapped
+                    else:
+                        # Spin AWAY from the closest shoulder/side
+                        total_left = min(d_side_left, d_left_shoulder)
+                        total_right = min(d_side_right, d_right_shoulder)
+                        self.avoid_direction = -0.5 if total_left < total_right else 0.5
+
+                lin_x = 0.0
+                ang_z = self.avoid_direction
+                self.prev_ang_z = 0.0
 
         # PRIORITY 2: SQUEEZE MODE
         elif d_front_left < 0.6 or d_front_right < 0.6:
-            self.avoid_direction = 0.0
+            self.avoid_direction = 0.0 # Reset panic direction
             self.squeeze_cooldown = self.COOLDOWN_LIMIT
             
             lin_x = self.speed * 0.7 # Slow down
@@ -241,7 +269,6 @@ class PatrolNavigator(Node):
 
         # PRIORITY 3: TAIL CLEARING
         elif self.squeeze_cooldown > 0:
-            self.avoid_direction = 0.0
             self.squeeze_cooldown -= 1
             lin_x = self.speed * 0.7
             ang_z = 0.0 
